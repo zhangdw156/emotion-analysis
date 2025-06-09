@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
-
 import json
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from transformers import BertTokenizer, BertForSequenceClassification, get_linear_schedule_with_warmup
+from transformers import BertTokenizer, get_linear_schedule_with_warmup
 from tqdm import tqdm
 import numpy as np
 from sklearn.metrics import accuracy_score, f1_score
@@ -12,20 +11,113 @@ import os
 from datetime import datetime
 import matplotlib
 from matplotlib import pyplot as plt
-# matplotlib.use('TkAgg')
+import math
+
+matplotlib.use('TkAgg')
 
 
 # 参数配置
 class Config:
     pretrained_model_path = "./model/bert-base-uncased"
+    vocab_size = 30522  # 与BERT tokenizer相同的词汇表大小
     train_data_path = "./data/train.json"
     val_data_path = "./data/validation.json"
-    batch_size = 256  # 根据8GB显存调整
+    batch_size = 128
     max_length = 128
     num_epochs = 100
     learning_rate = 2e-5
     num_labels = 6  # 6种情感类别
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    hidden_dropout_prob = 0.3
+    hidden_size = 768  # Transformer隐藏层大小
+    num_attention_heads = 12  # 注意力头数
+    num_hidden_layers = 6  # Transformer层数
+    intermediate_size = 3072  # FeedForward层中间维度
+
+
+# 位置编码
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:x.size(0), :]
+
+
+# Transformer分类器模型定义
+class TransformerClassifier(nn.Module):
+    def __init__(self, config):
+        super(TransformerClassifier, self).__init__()
+        self.config = config
+
+        # 词嵌入层
+        self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.position_encoding = PositionalEncoding(config.hidden_size, config.max_length)
+
+        # Transformer编码器
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_size,
+            nhead=config.num_attention_heads,
+            dim_feedforward=config.intermediate_size,
+            dropout=config.hidden_dropout_prob
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_hidden_layers)
+
+        # 分类层
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+
+        # 初始化权重
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        # 嵌入层
+        embeddings = self.embedding(input_ids)
+        embeddings = self.position_encoding(embeddings)
+
+        # 调整形状以适应Transformer (seq_len, batch_size, hidden_size)
+        embeddings = embeddings.permute(1, 0, 2)
+
+        # 创建key_padding_mask (batch_size, seq_len)
+        if attention_mask is not None:
+            key_padding_mask = attention_mask == 0
+        else:
+            key_padding_mask = None
+
+        # Transformer编码器
+        encoder_output = self.transformer_encoder(
+            src=embeddings,
+            src_key_padding_mask=key_padding_mask
+        )
+
+        # 获取[CLS]标记的隐藏状态 (第一个token)
+        cls_output = encoder_output[0, :, :]  # (batch_size, hidden_size)
+        cls_output = self.dropout(cls_output)
+        logits = self.classifier(cls_output)
+
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.config.num_labels), labels.view(-1))
+
+        return {'loss': loss, 'logits': logits}
 
 
 # 自定义数据集类
@@ -43,10 +135,7 @@ class EmotionDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        # 合并instruction和input作为模型输入
-        # text = item['instruction'] + " " + item['input']
-        text = "Please identify the emotions contained in the following text and output the corresponding labels. Label 0 corresponds to sadness, label 1 corresponds to joy, label 2 corresponds to love, label 3 corresponds to anger, label 4 corresponds to fear, label 5 corresponds to surprise." + " " + \
-               item['text']
+        text = item['text']
         label = int(item['label'])
 
         encoding = self.tokenizer(
@@ -85,14 +174,15 @@ def train(model, dataloader, optimizer, scheduler, device):
             labels=labels
         )
 
-        loss = outputs.loss
+        loss = outputs['loss']
         total_loss += loss.item()
 
         loss.backward()
         optimizer.step()
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
-        logits = outputs.logits.detach().cpu().numpy()
+        logits = outputs['logits'].detach().cpu().numpy()
         preds = np.argmax(logits, axis=1)
         predictions.extend(preds)
         true_labels.extend(labels.cpu().numpy())
@@ -126,10 +216,10 @@ def evaluate(model, dataloader, device):
                 labels=labels
             )
 
-            loss = outputs.loss
+            loss = outputs['loss']
             total_loss += loss.item()
 
-            logits = outputs.logits.detach().cpu().numpy()
+            logits = outputs['logits'].detach().cpu().numpy()
             preds = np.argmax(logits, axis=1)
             predictions.extend(preds)
             true_labels.extend(labels.cpu().numpy())
@@ -166,6 +256,7 @@ def plot_acc(train_accs, val_accs, dir_name):
     plt.grid(True)
     plt.savefig(f"{dir_name}/accuracy.png")
 
+
 def plot_f1(train_f1s, val_f1s, dir_name):
     plt.figure(figsize=(10, 5))
     plt.plot(train_f1s, label='Training F1')
@@ -182,12 +273,11 @@ def main():
     # 初始化配置
     config = Config()
 
-    # 加载tokenizer和模型
+    # 加载tokenizer (仍然使用BERT tokenizer，但模型是我们自己实现的)
     tokenizer = BertTokenizer.from_pretrained(config.pretrained_model_path)
-    model = BertForSequenceClassification.from_pretrained(
-        config.pretrained_model_path,
-        num_labels=config.num_labels
-    ).to(config.device)
+
+    # 初始化Transformer分类器模型
+    model = TransformerClassifier(config).to(config.device)
 
     # 加载数据集
     train_dataset = EmotionDataset(config.train_data_path, tokenizer, config.max_length)
@@ -238,16 +328,25 @@ def main():
         # 保存最佳模型
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            model.save_pretrained("./best_model_BERT")
-            tokenizer.save_pretrained("./best_model_BERT")
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'config': config,
+                'tokenizer': tokenizer,
+            }, "best_model_Transformer/transformer_model.bin")
             print("Best model saved!")
 
     datetime_str = datetime.now().strftime("%Y%m%d_%H_%M_%S")
-    dir_name: str = f'./history_model/emotion_calculate_BERT_{datetime_str}'
-    visual_dir: str = f"./history_model/visualization_BERT_{datetime_str}"
-    os.mkdir(visual_dir)
-    model.save_pretrained(dir_name)
-    tokenizer.save_pretrained(dir_name)
+    dir_name: str = f'./history_model/emotion_calculate_Transformer_{datetime_str}'
+    visual_dir: str = f"./history_model/visualization_Transformer_{datetime_str}"
+    os.makedirs(visual_dir, exist_ok=True)
+    os.makedirs(dir_name, exist_ok=True)
+
+    # 保存最终模型
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'config': config,
+        'tokenizer': tokenizer,
+    }, f"{dir_name}/transformer_model.bin")
 
     plot_result(train_losses, val_losses, visual_dir)
     plot_acc(train_accs, val_accs, visual_dir)
